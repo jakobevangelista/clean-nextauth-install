@@ -1,47 +1,49 @@
-import { auth, signIn, signOut } from "@/auth";
-
-import { AuthError } from "next-auth";
+"use client";
+import { SignIn, useUser } from "@clerk/nextjs";
 import { redirect } from "next/navigation";
+import { useEffect } from "react";
 
-export default async function SignIn() {
-  const session = await auth();
-  if (session === null) {
+export default function SignInComponent() {
+  //   const session = await auth();
+  const { user } = useUser();
+  useEffect(() => {
+    const origFetch = window.fetch;
+    window.fetch = async function (url, init) {
+      const originalRes = await origFetch(url, init);
+
+      if (originalRes.status === 422) {
+        const res = await fetch("/api/trickle2", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            email: init?.body,
+          }),
+        });
+
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        const data = await res.json();
+
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        if (data.error === "not exist") {
+          return originalRes;
+        } else {
+          const retry = await origFetch(url, init);
+          return retry;
+        }
+      }
+
+      return originalRes;
+    };
+    return () => {
+      window.fetch = origFetch;
+    };
+  });
+  if (user === null || user === undefined) {
     return (
       <>
-        <form
-          action={async (formData) => {
-            "use server";
-            try {
-              await signIn("credentials", {
-                email: formData.get("email"),
-                password: formData.get("password"),
-                redirectTo: "/",
-              });
-              console.log("Signed In");
-            } catch (error) {
-              console.log("ERROR");
-              if (error instanceof AuthError) {
-                switch (error.message) {
-                  case "CredentialsSignIn":
-                    return { error: "Invalid credentials" };
-                  default:
-                    return { error: "An error occurred" };
-                }
-              }
-              throw error;
-            }
-          }}
-        >
-          <label>
-            Email
-            <input className="text-black" name="email" type="email" />
-          </label>
-          <label>
-            Password
-            <input className="text-black" name="password" type="password" />
-          </label>
-          <button>Sign In with Credentials</button>
-        </form>
+        <SignIn forceRedirectUrl={"/"} />
       </>
     );
   }
