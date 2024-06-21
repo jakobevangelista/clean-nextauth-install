@@ -1,4 +1,4 @@
-# Migration Guide: Moving from Next-Auth to Clerk
+# Migration Guide: Moving from Next-Auth to Clerk 
 
 ## Introduction
 
@@ -11,20 +11,137 @@ Before you begin, ensure you have the following:
 - An active Clerk account.
 - Your current application using Next-Auth.
 - Access to your user database.
+(We're assuming all user data outside of user name, email, and password are stored in a tenet table (ie user_attribute table) with a foreign key that is the next-auth user primary key)
 
 ## Migration Overview
 
 To ensure a smooth migration with minimal disruption to your users, we will follow these steps:
-
-1. **Add Clerk Middleware and Nest Next-Auth Middleware**
-2. **Switch Data Access Patterns to Clerk**
-3. **Implement User Creation and Sign-In with Clerk**
-4. **Batch Import Existing Users**
-5. **Turn Off Next-Auth**
+1. **Batch Import Existing Users**
+2. **Add Clerk Middleware and Nest Next-Auth Middleware**
+3. **Implement Trickle Migration**
+4. **Implement Sign-up and Sign-in with Clerk**
+5. **Switch Data Access Patterns to Clerk**
+6. **Turn off all next-auth things and switch to clerk**
 
 ## Migration Steps
 
-### 1. Add Clerk Middleware
+### 1. Batch Import
+
+The batch import handles the migration of all users through a scheduled process, ensuring all users are migrated without overwhelming the system and hitting the rate limit (20req/10sec). We do this by limiting batch importing to 15req/10sec to allow the trickle migration to have some for its processing. (After v1, we want this to go as fast as possible with an exponential backoff in order to not have to manually keep track)
+
+#### Script to get all users in existing database within a queue
+
+Store all users in a queue for batch processing. This can be done using a standalone nodejs script. The implementation uses nextjs app router's server components. 
+
+The process is just iterating through all the users, storing them in a queue for the cron job to process individually. Definitely scaling concerns but you can modify this solution to fit your scale.
+
+As with the trickle migration, along with creating the user in clerk, we also want to update the user attribute table associated with the migrated user.
+
+```js
+// src/app/batch/page.tsx
+import { db } from "@/server/db";
+import { Redis } from "@upstash/redis";
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
+export default function Batch() {
+  async function buttonPress() {
+    "use server";
+    const users = await db.query.users.findMany();
+
+    for (const user of users) {
+      await redis.rpush("email", user.email);
+      await redis.rpush("password", user.password ?? "null");
+      await redis.rpush("id", user.id);
+      console.log("IMPORTED: ", user.email);
+    }
+  }
+  return (
+    <>
+      <form action={buttonPress}>
+        <button>Press me</button>
+      </form>
+    </>
+  );
+}
+```
+
+#### Backend API for Batch Import to import users into Clerk
+
+Use a cron job to process the queue and create users in Clerk, respecting rate limits. Using Upstash for the cron job running but you can use any job runner of your choice. Again, does not have to be in nextjs, can be any express-like backend. 
+
+```js
+// src/app/api/batch/route.ts
+
+import { clerkClient } from "@clerk/nextjs/server";
+import { Receiver } from "@upstash/qstash";
+import { Redis } from "@upstash/redis";
+import { headers } from "next/headers";
+
+const receiver = new Receiver({
+  currentSigningKey: process.env.QSTASH_CURRENT_SIGNING_KEY!,
+  nextSigningKey: process.env.QSTASH_NEXT_SIGNING_KEY!,
+});
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
+export async function POST() {
+  const headersList = headers();
+  const signature = headersList.get("Upstash-Signature");
+
+  if (!signature) {
+    return new Response("No signature", { status: 401 });
+  }
+
+  const isValid = await receiver.verify({
+    body: "",
+    signature,
+    url: process.env.WEBHOOK_URL!,
+  });
+
+  if (!isValid) {
+    return new Response("Invalid signature", { status: 401 });
+  }
+
+  const lengthOfQueue = await redis.llen("key");
+  const lengthOfLoop = lengthOfQueue > 20 ? 20 : lengthOfQueue;
+  for (let i = 0; i < lengthOfLoop; i++) {
+    const email = await redis.lpop<string | null>("email");
+    const password = await redis.lpop<string | null>("password");
+    const id = await redis.lpop<string>("id");
+    if (!email) break;
+
+    const searchUser = await clerkClient.users.getUserList({ emailAddress: [email] });
+
+    if (searchUser.data.length > 0) {
+      continue;
+    } else {
+      const createdUser = await clerkClient.users.createUser({
+        emailAddress: [email],
+        password: password === "null" ? undefined : password!,
+        externalId: id!,
+        skipPasswordRequirement: true,
+        skipPasswordChecks: true,
+      });
+
+      // updates the user's attribute table entry with their clerk id
+      await db.update(userAttributes).set({
+      clerkId: createdUser.id
+      }).where(eq(userAttributes.userId, createdUser.externalId));
+    }
+  }
+  console.log("BATCH IMPORTING WORKS");
+  return new Response("OK", { status: 200 });
+}
+```
+
+### 2. Add Clerk Middleware
 
 We need Clerk's middleware in order to use useSign in.
 
@@ -56,120 +173,9 @@ export const config = {
   matcher: ["/((?!.*\\..*|_next).*)", "/", "/(api|trpc)(.*)"],
 };
 ```
-
-### 2. Migrate Data Access Patterns (/src/app/page.tsx)
-
-<!-- need to implement code example with diffs graphic -->
-
-Update all data access patterns to use Clerk's auth() instead of NextAuth's auth(). While the migration is happening, we will use the external_id from clerk in order to retrieve data.
-
-```diff
-- import { auth } from "@/auth";
-+ import { auth } from "@clerk/nextjs/server"
-
--  const session = await auth();
--  if (!session) return <div>Not Signed In</div>;
-
-+ const { userId } : { userId: string | null } = await auth();
-+ if (!userId) <div>Not Signed In</div>;
-
-or
-
-+ import { currentUser } from "@clerk/nextjs/server"
-+ const user = await currentUser();
-+ if(!user) <div>Not Signed In </div>;
-
-```
-
-#### Add clerkid attribute to tenet table
-
-Add add a clerkId attribute to your user_attributes table, this allows you to use both the next-auth id, which is stored in external_id in clerk, or clerk id during migration, and eventually transition to only using clerkid.
-
-```diff
-export const userAttributes = pgTable("user_attribute", {
-  id: text("id")
-    .primaryKey()
-    .$defaultFn(() => crypto.randomUUID()),
-  userId: text("userId").references(() => users.id, { onDelete"cascade" }),
-+  clerkId: text("clerkId"),
-  attribute: text("attribute").default("customer"),
-});
-```
-
-### Custom session claims
-
-Our sessions allow for conditional expressions. This would allow you add a session claim that will return either the `externalId` (the previous id for your user) when it exists, or the `userId` from Clerk. This will result in your imported users returning their `externalId` while newer users will return the Clerk `userId`.
-
-In your Dashboard, go to Sessions -> Edit. Add the following: 
-
-```json
-{
-	"userId": "{{user.external_id || user.id}}"
-}
-```
-
-You can now access this value using the following:
-```ts 
-const { sessionClaims } = auth();
-console.log(sessionClaims.userId) 
-```
-
-You can add the following for typescript: 
-```js
-// types/global.d.ts
-
-export { };
-
-declare global {
-  interface CustomJwtSessionClaims {
-    userId?: string;
-  }
-}
-```
-
-#### Here is an example of accessing the tenet tables with the new patterns
-
-```js
-// src/app/page.tsx
-
-import { db } from "@/server/neonDb";
-import { userAttributes, users } from "@/server/neonDb/schema";
-import { UserButton } from "@clerk/nextjs";
-import { auth, currentUser } from "@clerk/nextjs/server";
-import { eq } from "drizzle-orm";
-
-import { redirect } from "next/navigation";
-
-export default async function Home() {
-  const user = await currentUser();
-  if (user === null) {
-    return redirect("/sign-in");
-  }
-
-  let userAttribute = null
-
-  // check if userId is either next auth id or clerkid
-  userAttribute = await db.query.userAttributes.findFirst({
-    where: eq(userAttributes.userId, dbUser?.id!),
-  });
-
-  if(userAttribute === null) {
-     userAttribute = await db.query.userAttributes.findFirst({
-       where: eq(userAttributes.clerkId, dbUser?.id!),
-     });
-  }
-
-  return (
-    <>
-      <div>Special Attribute: {userAttribute?.attribute}</div>
-      <UserButton />
-    </>
-  );
-}
-```
-
-
 ### 3. Trickle Migration
+
+<!-- Users need to add clerkprovider in order for this to work so we can somehow fit it into the docs later -->
 
 Use the following code to create users in Clerk and sign them in, this auto signs users in that were previously signed into nextauth allowing zero-downtime sign in:
 
@@ -182,6 +188,8 @@ We are using the "external_id" attribute within the createUser function. This al
 We query the tenet table and pass the data to the children as an example of how to use the external_id function.
 
 Along with creating the user in clerk, we also want to update the user attribute table associated with the migrated user.
+
+(As noted in batch, eventually we want this to be able to fail in order to get maximum speedup, because with the v1, we're just hoping for 5req/10sec would be enough)
 
 
 ```js
@@ -376,223 +384,7 @@ export default function RootLayout({
 }
 ```
 
-### 5. Batch Import
-
-The batch import handles the migration of inactive users through a scheduled process, ensuring all users are migrated without overwhelming the system.
-
-#### Script to get all users in existing database within a queue
-
-Store all users in a queue for batch processing. This can be done using a standalone nodejs script. The implementation uses nextjs app router's server components. 
-
-The process is just iterating through all the users, storing them in a queue for the cron job to process individually. Definitely scaling concerns but you can modify this solution to fit your scale.
-
-As with the trickle migration, along with creating the user in clerk, we also want to update the user attribute table associated with the migrated user.
-
-```js
-// src/app/batch/page.tsx
-import { db } from "@/server/db";
-import { Redis } from "@upstash/redis";
-
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
-
-export default function Batch() {
-  async function buttonPress() {
-    "use server";
-    const users = await db.query.users.findMany();
-
-    for (const user of users) {
-      await redis.rpush("email", user.email);
-      await redis.rpush("password", user.password ?? "null");
-      await redis.rpush("id", user.id);
-      console.log("IMPORTED: ", user.email);
-    }
-  }
-  return (
-    <>
-      <form action={buttonPress}>
-        <button>Press me</button>
-      </form>
-    </>
-  );
-}
-```
-
-#### Backend API for Batch Import to import users into Clerk
-
-Use a cron job to process the queue and create users in Clerk, respecting rate limits. Using Upstash for the cron job running but you can use any job runner of your choice. Again, does not have to be in nextjs, can be any express-like backend. 
-
-```js
-// src/app/api/batch/route.ts
-
-import { clerkClient } from "@clerk/nextjs/server";
-import { Receiver } from "@upstash/qstash";
-import { Redis } from "@upstash/redis";
-import { headers } from "next/headers";
-
-const receiver = new Receiver({
-  currentSigningKey: process.env.QSTASH_CURRENT_SIGNING_KEY!,
-  nextSigningKey: process.env.QSTASH_NEXT_SIGNING_KEY!,
-});
-
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
-
-export async function POST() {
-  const headersList = headers();
-  const signature = headersList.get("Upstash-Signature");
-
-  if (!signature) {
-    return new Response("No signature", { status: 401 });
-  }
-
-  const isValid = await receiver.verify({
-    body: "",
-    signature,
-    url: process.env.WEBHOOK_URL!,
-  });
-
-  if (!isValid) {
-    return new Response("Invalid signature", { status: 401 });
-  }
-
-  const lengthOfQueue = await redis.llen("key");
-  const lengthOfLoop = lengthOfQueue > 20 ? 20 : lengthOfQueue;
-  for (let i = 0; i < lengthOfLoop; i++) {
-    const email = await redis.lpop<string | null>("email");
-    const password = await redis.lpop<string | null>("password");
-    const id = await redis.lpop<string>("id");
-    if (!email) break;
-
-    const searchUser = await clerkClient.users.getUserList({ emailAddress: [email] });
-
-    if (searchUser.data.length > 0) {
-      continue;
-    } else {
-      const createdUser = await clerkClient.users.createUser({
-        emailAddress: [email],
-        password: password === "null" ? undefined : password!,
-        externalId: id!,
-        skipPasswordRequirement: true,
-        skipPasswordChecks: true,
-      });
-
-      // updates the user's attribute table entry with their clerk id
-      await db.update(userAttributes).set({
-      clerkId: createdUser.id
-      }).where(eq(userAttributes.userId, createdUser.externalId));
-    }
-  }
-  console.log("BATCH IMPORTING WORKS");
-  return new Response("OK", { status: 200 });
-}
-```
-### 6. Handling users that need to sign in during migration
-
-There is a case where registered users need to sign in during the migration and they haven't have yet been added to clerk through the batch import. To solve this, we have a script is added to the sign in page in order to add those users into clerk as well as sign them in with their already existing information. It calls to an api point in /api/trickle2 that facilitates the inserting of the user to clerk.
-
-#### Here is the script that runs on sign in:
-```js
-// src/app/sign-in/[[...sign-in]]/page.tsx
-
-"use client";
-import { redirect } from "next/navigation";
-import { auth as clerkAuthFunction } from "@clerk/nextjs/server";
-import { SignIn, useUser } from "@clerk/nextjs";
-import { useEffect } from "react";
-
-export default function SignInComponent() {
-  //   const session = await auth();
-  const { user } = useUser();
-  useEffect(() => {
-    const origFetch = window.fetch;
-    window.fetch = async function (url, init) {
-      const originalRes = await origFetch(url, init);
-
-      if (originalRes.status === 422) {
-        const res = await fetch("/api/trickle2", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            email: init?.body,
-          }),
-        });
-
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        const data = await res.json();
-
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-        if (data.error === "not exist") {
-          return originalRes;
-        } else {
-          const retry = await origFetch(url, init);
-          return retry;
-        }
-      }
-
-      return originalRes;
-    };
-    return () => {
-      window.fetch = origFetch;
-    };
-  });
-  if (user === null || user === undefined) {
-    return (
-      <>
-        <SignIn forceRedirectUrl={"/"} />
-      </>
-    );
-  }
-
-  return redirect("/");
-}
-```
-#### This is the api point that the script calls
-```js
-// src/app/api/trickle2/route.ts
-
-import { db } from "@/server/neonDb";
-import { users } from "@/server/neonDb/schema";
-import { clerkClient } from "@clerk/nextjs/server";
-import { eq } from "drizzle-orm";
-import type { NextRequest, NextResponse } from "next/server";
-
-export const POST = async (req: NextRequest, res: NextResponse) => {
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-  const body = await req.json();
-  console.log("REQ BODY: ", body);
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
-  const onlyEmail = decodeURIComponent(body.email.split("=")[1]);
-  const user = await db.query.users.findFirst({
-    where: eq(users.email, onlyEmail),
-  });
-  if (!user) {
-    return Response.json({ error: "not exist" });
-  }
-
-  const createdUser = await clerkClient.users.createUser({
-    emailAddress: [onlyEmail],
-    password: user.password ?? undefined,
-    skipPasswordChecks: true,
-    externalId: `${user.id}`,
-  });
-
-  await db.update(userAttributes).set({
-      clerkId: createdUser.id
-      }).where(eq(userAttributes.userId, createdUser.externalId));
-
-  return Response.json({ succes: "user exists" });
-};
-
-```
-
-### 7. Sign Ups go through the clerk component
+### 5. Sign-Ups and Sign-Ins go through the clerk components
 
 New user sign ups go through the clerk components
 
@@ -615,7 +407,143 @@ export default async function SignUpComponent() {
 
   return redirect("/");
 }
+
+// src/app/sign-in/[[...sign-i]]/page.tsx
+import { SignIn } from "@clerk/nextjs";
+import { auth } from "@clerk/nextjs/server";
+
+import { redirect } from "next/navigation";
+
+export default async function SignInComponent() {
+  const { userId }: { userId: string | null } = await auth();
+  if (userId === null) {
+    return (
+      <>
+        <SignIn forceRedirectUrl={"/"} />
+      </>
+    );
+  }
+
+  return redirect("/");
+}
 ```
+### 6. Migrate Data Access Patterns (/src/app/page.tsx)
+
+<!-- need to implement code example with diffs graphic -->
+
+Update all data access patterns to use Clerk's auth() instead of NextAuth's auth(). While the migration is happening, we will use the external_id from clerk in order to retrieve data.
+
+```diff
+- import { auth } from "@/auth";
++ import { auth } from "@clerk/nextjs/server"
+
+-  const session = await auth();
+-  if (!session) return <div>Not Signed In</div>;
+
++ const { userId } : { userId: string | null } = await auth();
++ if (!userId) <div>Not Signed In</div>;
+
+or
+
++ import { currentUser } from "@clerk/nextjs/server"
++ const user = await currentUser();
++ if(!user) <div>Not Signed In </div>;
+
+```
+
+#### Add clerkid attribute to tenet table
+
+Add add a clerkId attribute to your user_attributes table, this allows you to use both the next-auth id, which is stored in external_id in clerk, or clerk id during migration, and eventually transition to only using clerkid.
+
+```diff
+export const userAttributes = pgTable("user_attribute", {
+  id: text("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  userId: text("userId").references(() => users.id, { onDelete"cascade" }),
++  clerkId: text("clerkId"),
+  attribute: text("attribute").default("customer"),
+});
+```
+
+#### Custom session claims
+
+Our sessions allow for conditional expressions. This would allow you add a session claim that will return either the `externalId` (the previous id for your user) when it exists, or the `userId` from Clerk. This will result in your imported users returning their `externalId` while newer users will return the Clerk `userId`.
+
+In your Dashboard, go to Sessions -> Edit. Add the following: 
+
+```json
+{
+	"userId": "{{user.external_id || user.id}}"
+}
+```
+
+You can now access this value using the following:
+```ts 
+const { sessionClaims } = auth();
+console.log(sessionClaims.userId) 
+```
+
+You can add the following for typescript: 
+```js
+// types/global.d.ts
+
+export { };
+
+declare global {
+  interface CustomJwtSessionClaims {
+    userId?: string;
+  }
+}
+```
+
+#### Here is an example of accessing the tenet tables with the new patterns
+
+```js
+// src/app/page.tsx
+
+import { db } from "@/server/neonDb";
+import { userAttributes, users } from "@/server/neonDb/schema";
+import { UserButton } from "@clerk/nextjs";
+import { auth, currentUser } from "@clerk/nextjs/server";
+import { eq } from "drizzle-orm";
+
+import { redirect } from "next/navigation";
+
+export default async function Home() {
+  const user = await currentUser();
+  if (user === null) {
+    return redirect("/sign-in");
+  }
+
+  let userAttribute = null
+
+  // check if userId is either next auth id or clerkid
+  userAttribute = await db.query.userAttributes.findFirst({
+    where: eq(userAttributes.userId, dbUser?.id!),
+  });
+
+  if(userAttribute === null) {
+     userAttribute = await db.query.userAttributes.findFirst({
+       where: eq(userAttributes.clerkId, dbUser?.id!),
+     });
+  }
+
+  return (
+    <>
+      <div>Special Attribute: {userAttribute?.attribute}</div>
+      <UserButton />
+    </>
+  );
+}
+```
+
+### 7. Switch all instances of next auth with clerk after batch import rate falls below rate limit
+
+This happens when 
+
+Af
+
 ### 8. (Optional) Setup API point to sync data with next auth
 
 If you setup a webhook through the clerk dashboard and configure it to send events on user.created, this will allow you to setup an endpoint that allows you to sync the signed up users in clerk to your existing nextauth backend in case of rollback.
