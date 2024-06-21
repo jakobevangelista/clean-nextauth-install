@@ -11,7 +11,7 @@ Before you begin, ensure you have the following:
 - An active Clerk account.
 - Your current application using Next-Auth.
 - Access to your user database.
-(We're assuming all user data outside of user name, email, and password are stored in a tenet table (ie user_attribute table) with a foreign key that is the next-auth user primary key)
+(We're assuming all user data outside of user name, email, and password are stored in a tenet table (ie user_attribute table) with a foreign key that is the next-auth user primary key, definitely lots of holes with this assumption)
 
 ## Migration Overview
 
@@ -540,36 +540,17 @@ export default async function Home() {
 
 ### 7. Switch all instances of next auth with clerk after batch import rate falls below rate limit
 
-This happens when 
-
-Af
-
-### 8. (Optional) Setup API point to sync data with next auth
-
-If you setup a webhook through the clerk dashboard and configure it to send events on user.created, this will allow you to setup an endpoint that allows you to sync the signed up users in clerk to your existing nextauth backend in case of rollback.
-
-Here is a rough overview of how it would look
-
-```js
-// need to put file path here
-export default const POST(req: Request) => {
-  const body = req.json();
-
-  await db.insert(users).values({
-    email: body.emailAddresses[0].emailAddress,
-    name: body.first_name + body.last_name,
-  })
-}
-```
+Flip the switch and everything is ok.
 
 ## Overview of migration flow
 <!-- I am unsure how much we should hand hold the migrator -->
 
-1. Migrate all auth helper functions to use clerk's auth function ie clerk's auth() and/or currentUser() and/or sessionClaims.userId
-2. Batch import and trickle migration
-    - While this is going on, users will sign in through clerk. The sign in component has a special effect that runs that adds the user to clerk if they haven't already migrated during the batch import.
-3. New users sign up with clerk components
-4. Once the batch import is finished and all users are imported into clerk, you can delete the sign in script, it's api points, and the batch import api point
+1. Batch import, add your entire user table to clerk, checks if user is already added in next auth
+2. Trickle migrate users that already signed in 
+   - This allows users who are already signed into next auth to have a seamless sign in to clerk
+   - Checks if user has been already added through trickle migrate
+3. Add all the clerk stuff, providers, sign in / sign up components, data access / auth helper functions, but don't activate them till all the users are imported into clerk
+4. Once the batch import is finished and all users are imported into clerk, you can switch the to using clerks stuff
 
 ## Wrapping Up
 With your users now imported into Clerk and your application updated, you can fully switch to using Clerk for authentication. This guide provides a comprehensive approach to migrating from Next-Auth to Clerk with minimal disruption to

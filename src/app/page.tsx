@@ -1,13 +1,13 @@
-import { auth, signOut } from "@/auth";
 import { db } from "@/server/neonDb";
 import { userAttributes, users } from "@/server/neonDb/schema";
+import { auth } from "@clerk/nextjs/server";
 import { eq } from "drizzle-orm";
 
 import { redirect } from "next/navigation";
 
 export default async function Home() {
-  const session = await auth();
-  if (session === null) {
+  const { userId }: { userId: string | null } = await auth();
+  if (userId === null) {
     return redirect("/sign-in");
   }
 
